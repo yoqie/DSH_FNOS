@@ -197,17 +197,18 @@ if [ ! -e "${APP_CONTENT}/node_modules/.bin/pnpm" ] && [ ! -f "${APP_CONTENT}/no
     echo "FATAL: 打包产物缺少 pnpm（插件安装功能将不可用）" >&2
     exit 1
 fi
-# 原生模块校验：arm64 运行器上原生安装，产物应为 linux-arm64
-# 必须有 linux-arm64 产物；除 node-pty 自带的全平台 prebuilds 外不得有 linux-x64 产物
-if ! find "${APP_CONTENT}" -name "*.node" -path "*linux-arm64*" | grep -q .; then
-    echo "FATAL: 未找到 linux-arm64 原生模块，arm64 NAS 上无法运行" >&2
+# 原生模块校验：按目标架构参数化（TARGET_ARCH=amd64/arm64，NODE_ARCH=x64/arm64，
+# 由 CI 的 job 级环境变量传入，与运行器架构一致）
+OTHER_ARCH=x64; [ "${NODE_ARCH}" = "x64" ] && OTHER_ARCH=arm64
+if ! find "${APP_CONTENT}" -name "*.node" -path "*linux-${NODE_ARCH}*" | grep -q .; then
+    echo "FATAL: 未找到 linux-${NODE_ARCH} 原生模块，${TARGET_ARCH} NAS 上无法运行" >&2
     exit 1
 fi
-if find "${APP_CONTENT}" -name "*.node" -path "*linux-x64*" | grep -v "node-pty" | grep -q .; then
-    echo "FATAL: 包内混入 linux-x64 原生模块，请检查运行器架构" >&2
-    find "${APP_CONTENT}" -name "*.node" -path "*linux-x64*" | grep -v "node-pty" >&2
+if find "${APP_CONTENT}" -name "*.node" -path "*linux-${OTHER_ARCH}*" | grep -v "node-pty" | grep -q .; then
+    echo "FATAL: 包内混入 linux-${OTHER_ARCH} 原生模块，请检查运行器架构" >&2
+    find "${APP_CONTENT}" -name "*.node" -path "*linux-${OTHER_ARCH}*" | grep -v node-pty >&2
     exit 1
 fi
-echo "    原生模块校验通过（linux-arm64 产物齐全）"
+echo "    原生模块校验通过（linux-${NODE_ARCH} 产物齐全，${TARGET_ARCH}）"
 
 echo "==> 组装完成: ${APP_PKG}（应用内容在 ${APP_CONTENT}）"
