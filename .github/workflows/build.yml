@@ -1,7 +1,11 @@
 # =============================================================
-# DSH for fnOS - GitHub Actions 自动构建
+# DSH for fnOS - GitHub Actions 自动构建（amd64 + arm64 双架构）
 #
-# 全程在 GitHub arm64 服务器上构建，NAS 本机零负担
+# 全程在 GitHub 服务器上原生构建，NAS 本机零负担：
+#   amd64 → ubuntu-24.04（x86_64 原生运行器）
+#   arm64 → ubuntu-24.04-arm（ARM64 原生运行器，公共仓库免费）
+# 依赖的原生模块（koffi/node-pty 等）在各自架构上原生安装，
+# 与 NAS 架构一致，免去交叉安装导致的产物架构不匹配。
 #
 # 触发方式：
 #   1. push 到 master 自动构建
@@ -9,7 +13,11 @@
 #   3. 每日定时检查上游是否发新版，有新版本才构建发布
 #
 # 流程：拉上游源码 -> pnpm 构建 -> pack tgz -> 组装应用壳（运行时用 nodejs_v24 依赖）
-#      -> fnpack 打包 -> 上传 artifact + 发 GitHub Release
+#      -> fnpack 打包（按架构取官方对应二进制）-> 上传 artifact -> 汇总发 GitHub Release
+#
+# Release 产物（同一 tag 下两个资产，按 NAS 架构选用）：
+#   DSH_v<版本>_amd64.fpk → x86_64（AMD/Intel）NAS
+#   DSH_v<版本>_arm64.fpk → ARM64 NAS
 # =============================================================
 name: build
 
@@ -41,10 +49,26 @@ permissions:
 
 jobs:
   build:
-    # 原生 arm64 运行器（公共仓库免费）：
-    # 依赖的原生模块（koffi/node-pty 等）直接按 arm64 原生安装，与 NAS 架构一致，
-    # 免去 x64 上交叉安装导致的产物架构不匹配
-    runs-on: ubuntu-24.04-arm
+    name: 构建并打包（${{ matrix.arch }}）
+    strategy:
+      # 一个架构失败不取消另一个，便于定位单侧问题
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64：AMD/Intel NAS 主流架构；npm 原生产物目录名为 linux-x64
+          - arch: amd64
+            runner: ubuntu-24.04
+            node_arch: x64
+          # ARM64 NAS；npm 原生产物目录名为 linux-arm64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            node_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      # TARGET_ARCH：fnpack 官方二进制后缀与 fpk 产物命名（amd64/arm64）
+      TARGET_ARCH: ${{ matrix.arch }}
+      # NODE_ARCH：npm 原生模块预编译产物目录名（x64/arm64）
+      NODE_ARCH: ${{ matrix.node_arch }}
     steps:
       - name: Checkout 本仓库（应用壳）
         uses: actions/checkout@v4
@@ -62,7 +86,7 @@ jobs:
         run: |
           DSH_VERSION=$(node -p "require('./upstream/package.json').version")
           echo "version=${DSH_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "上游版本: ${DSH_VERSION}"
+          echo "上游版本: ${DSH_VERSION}（目标架构: ${TARGET_ARCH}）"
 
       - name: 查询是否需要构建
         id: check
@@ -102,10 +126,10 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         working-directory: upstream
         run: |
-          echo "=== [A] pnpm install 上游开始 ==="
+          echo "=== [A] pnpm install 上游开始（${TARGET_ARCH}） ==="
           pnpm install
           echo "=== [A] pnpm install 上游完成 ==="
-          echo "=== [B] pnpm run build 开始（内存最大 6GB）==="
+          echo "=== [B] pnpm run build 开始（内存最大 6GB） ==="
           NODE_OPTIONS="--max-old-space-size=6144" pnpm run build
           echo "=== [B] pnpm run build 完成 ==="
 
@@ -161,12 +185,15 @@ jobs:
           EOF
           echo "=== [C] pack tgz 完成: $(ls -la ../tgz) ==="
 
-      - name: 安装 fnpack（飞牛官方打包工具）
+      - name: 安装 fnpack（飞牛官方打包工具，按架构取二进制）
         if: steps.check.outputs.skip != 'true'
         run: |
-          # 官方静态分发地址（直接是二进制，非 zip）
-          # arm64 运行器，用 arm64 版 fnpack
-          FNPACK_URL="https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-arm64"
+          # 官方静态分发地址（直接是二进制，非 zip）：
+          #   amd64 → https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-amd64
+          #   arm64 → https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-arm64
+          # 注意：官方命名用 amd64 而非 x64，与 TARGET_ARCH 取值一致
+          FNPACK_URL="https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-${TARGET_ARCH}"
+          echo "下载 fnpack: ${FNPACK_URL}"
           curl -sfL --retry 3 -o /tmp/fnpack "${FNPACK_URL}"
           chmod +x /tmp/fnpack
           sudo mv /tmp/fnpack /usr/local/bin/fnpack
@@ -178,6 +205,8 @@ jobs:
         env:
           DSH_VERSION: ${{ steps.ver.outputs.version }}
           DSH_TGZ: ${{ env.DSH_TGZ }}
+          # TARGET_ARCH/NODE_ARCH 已在 job 级 env 定义，assemble.sh 读取 TARGET_ARCH
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           STAGE_DIR="${GITHUB_WORKSPACE}/stage" \
           UPSTREAM_DIR="${GITHUB_WORKSPACE}/upstream" \
@@ -196,21 +225,22 @@ jobs:
           } > debug-snapshot.txt 2>&1 || true
           cat debug-snapshot.txt
 
-      - name: 校验包体（arm64 原生产物齐全）
+      - name: 校验包体（目标架构原生产物齐全）
         if: steps.check.outputs.skip != 'true'
         run: |
-          # arm64 原生运行器上安装，产物应为 linux-arm64；node-pty 自带全平台 prebuilds 放行
-          if ! find stage/DSH -name "*.node" -path "*linux-arm64*" | grep -q .; then
-            echo "::error::未找到 linux-arm64 原生模块，arm64 NAS 无法运行"
+          # CI 上按目标架构原生安装：必须有 linux-${NODE_ARCH} 产物；
+          # 除 node-pty 自带的全平台 prebuilds 外，不得混入另一架构的产物
+          if ! find stage/DSH -name "*.node" -path "*linux-${NODE_ARCH}*" | grep -q .; then
+            echo "::error::未找到 linux-${NODE_ARCH} 原生模块，${TARGET_ARCH} NAS 无法运行"
             exit 1
           fi
-          # node-pty 包结构自带全平台 prebuilds，放行
-          if find stage/DSH -name "*.node" -path "*linux-x64*" | grep -v "node-pty" | grep -q .; then
-            echo "::error::包内混入 linux-x64 原生模块（运行器架构不对？）"
-            find stage/DSH -name "*.node" -path "*linux-x64*" | grep -v node-pty
+          if [ "${NODE_ARCH}" = "x64" ]; then OTHER_ARCH=arm64; else OTHER_ARCH=x64; fi
+          if find stage/DSH -name "*.node" -path "*linux-${OTHER_ARCH}*" | grep -v "node-pty" | grep -q .; then
+            echo "::error::包内混入 linux-${OTHER_ARCH} 原生模块（运行器架构不对？）"
+            find stage/DSH -name "*.node" -path "*linux-${OTHER_ARCH}*" | grep -v node-pty
             exit 1
           fi
-          echo "✓ 包体校验通过（linux-arm64 产物齐全）"
+          echo "✓ 包体校验通过（linux-${NODE_ARCH} 产物齐全，${TARGET_ARCH}）"
 
       - name: fnpack 打包
         if: steps.check.outputs.skip != 'true'
@@ -224,45 +254,81 @@ jobs:
           fi
           fnpack build
           FPK=$(ls *.fpk | head -1)
-          # 产物名带版本号，如 DSH_v0.1.7-rc.2_all.fpk
-          mv "${FPK}" "${GITHUB_WORKSPACE}/DSH_v${DSH_VERSION}_all.fpk"
+          # 产物名带架构与版本号，如 DSH_v0.1.7-rc.2_amd64.fpk
+          mv "${FPK}" "${GITHUB_WORKSPACE}/DSH_v${DSH_VERSION}_${TARGET_ARCH}.fpk"
 
       - name: 上传构建产物 artifact
         if: steps.check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: DSH_v${{ steps.ver.outputs.version }}_all
-          path: DSH_v${{ steps.ver.outputs.version }}_all.fpk
+          name: DSH_v${{ steps.ver.outputs.version }}_${{ matrix.arch }}
+          path: DSH_v${{ steps.ver.outputs.version }}_${{ matrix.arch }}.fpk
+
+  release:
+    name: 发布 Release（双架构汇总）
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 汇总双架构产物
+        id: collect
+        # 定时任务且上游版本未变化时无产物可下载，不视为失败
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: DSH_v*
+          merge-multiple: true
+          path: dist
+
+      - name: 检查产物
+        id: guard
+        run: |
+          COUNT=$(ls dist/*.fpk 2>/dev/null | wc -l)
+          echo "待发布 fpk 数量: ${COUNT}"
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+      - name: 解析版本号
+        if: steps.guard.outputs.count != '0'
+        id: ver
+        run: |
+          NAME=$(basename "$(ls dist/*.fpk | head -1)")
+          VERSION=$(echo "${NAME}" | sed -E 's/^DSH_v(.*)_(amd64|arm64)\.fpk$/\1/')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "DSH 版本: ${VERSION}"
 
       - name: 发布 GitHub Release
-        if: steps.check.outputs.skip != 'true'
+        if: steps.guard.outputs.count != '0'
         env:
           GH_TOKEN: ${{ github.token }}
           DSH_VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          # Release 说明（幂等：每次构建都重新生成）
-          cat > release-notes.md <<'NOTES'
-          DeepSeek Harness v${DSH_VERSION} 飞牛 fnOS 自动构建版（arm64 原生构建）。
+          # Release 说明（幂等：每次发布都重新生成）
+          # heredoc 未加引号：${DSH_VERSION} 由环境变量展开
+          cat > release-notes.md <<NOTES
+          DeepSeek Harness v${DSH_VERSION} 飞牛 fnOS 自动构建版（GitHub Actions 双架构原生构建）。
+
+          **按 NAS 架构下载**：
+          - x86_64（AMD/Intel，绝大多数 NAS 与虚拟机）→ DSH_v${DSH_VERSION}_amd64.fpk
+          - ARM64 → DSH_v${DSH_VERSION}_arm64.fpk
 
           **更新内容见上游**: https://github.com/deepseek-ai/deepseek-harness
 
           **安装/升级方式**:
-          1. 下载下方 `DSH_v${DSH_VERSION}_all.fpk`
+          1. 下载与 NAS 架构对应的 fpk
           2. 飞牛应用中心 → 手动安装 → 上传该文件（已安装则覆盖升级）
           3. 安装向导中确认服务端口（默认 3082）
           4. 依赖：应用中心需已安装 nodejs_v24 运行时
 
-          **访问方式**: 飞牛桌面点 DSH 卡片，或浏览器打开 `http://NAS地址:3082`
+          **访问方式**: 飞牛桌面点 DSH 卡片，或浏览器打开 http://NAS地址:3082
           NOTES
           # tag 已存在则更新资产与说明，否则创建
           if gh release view "v${DSH_VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release v${DSH_VERSION} 已存在，更新资产"
-            gh release upload "v${DSH_VERSION}" --repo "$GITHUB_REPOSITORY" --clobber "DSH_v${DSH_VERSION}_all.fpk"
+            gh release upload "v${DSH_VERSION}" --repo "$GITHUB_REPOSITORY" --clobber dist/*.fpk
             gh release edit "v${DSH_VERSION}" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
           else
             gh release create "v${DSH_VERSION}" \
               --repo "$GITHUB_REPOSITORY" \
               --title "DSH v${DSH_VERSION}" \
               --notes-file release-notes.md \
-              "DSH_v${DSH_VERSION}_all.fpk"
+              dist/*.fpk
           fi
